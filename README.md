@@ -24,7 +24,7 @@ an amalgamated source file.
    `amalglua.c` which includes all the sources for the Lua library,
    the standalone interpreter, and the `luac` bytecode compiler.
 3. Use the appropriate compiler incantation to compile the file. (E.g.
-   to compile the standalone interpreter on my Linux box use:
+   to compile the standalone interpreter on my Linux box I use):
 
 ```
 gcc -O2 -Wall -DLUA_COMPAT_ALL -DLUA_USE_LINUX -o amalglua amalglua.c -Wl,-E -lm -ldl -lreadline
