@@ -26,7 +26,9 @@ an amalgamated source file.
 3. Use the appropriate compiler incantation to compile the file. (E.g.
    to compile the standalone interpreter on my Linux box use:
 
-    gcc -O2 -Wall -DLUA_COMPAT_ALL -DLUA_USE_LINUX -o amalglua amalglua.c -Wl,-E -lm -ldl -lreadline
+```
+gcc -O2 -Wall -DLUA_COMPAT_ALL -DLUA_USE_LINUX -o amalglua amalglua.c -Wl,-E -lm -ldl -lreadline
+```
 
   [2]: http://www.lua.org/
   [3]: http://lua-users.org/lists/lua-l/2011-12/msg00249.html
