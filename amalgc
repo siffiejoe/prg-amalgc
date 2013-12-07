@@ -1,0 +1,300 @@
+#!/usr/bin/perl -w
+use strict;
+use Pod::Usage;
+use Getopt::Long;
+use Digest::MD5;
+
+
+### process commandline options
+my @incdirs = ();
+my $output = '-';
+my $plines = 0;
+my $help = 0;
+GetOptions( "include=s@" => \@incdirs,
+            "output=s" =>   \$output,
+            "lines" =>      \$plines,
+            "help" =>       \$help );
+pod2usage( -verbose => 2,
+           -exitval => 0,
+           -noperldoc => 1 ) if $help;
+pod2usage( "no C files given" ) unless @ARGV;
+
+
+### utility functions
+sub open_output( $ ) {
+  my( $out ) = @_;
+  if( $out eq '-' ) {
+    return \*STDOUT;
+  } else {
+    open( my $fh, ">$out" ) or die( "Can't open $out: $!" );
+    return $fh;
+  }
+}
+
+sub normalize( $ ) {
+  my( $dir ) = @_;
+  $dir .= '/' unless $dir =~ m#/$#;
+  return $dir;
+}
+
+sub find_file( $$ ) {
+  my( $incname, $searchpath ) = @_;
+  foreach my $dir ( @$searchpath ) {
+    my $f = &normalize( $dir ) . $incname;
+    if( -f $f ) {
+      $f =~ s/^\.\///;
+      return $f;
+    }
+  }
+}
+
+sub file_id( $ ) {
+  my( $fname ) = @_;
+  open( my $fh, "<$fname" ) or die( "Can't open $fname: $!" );
+  my $ctx = Digest::MD5->new();
+  $ctx->addfile( $fh );
+  seek( $fh, 0, 0 );
+  return ( $ctx->hexdigest(), $fh );
+}
+
+sub compress_empty_lines( $ ) {
+  my( $state ) = @_;
+  if( !$state->{continue} and
+      !$state->{preserve_ln} and
+      $state->{buffer} =~ m/^\s*$/ ) {
+    $state->{buffer} = '';
+    $state->{current} = \&parse_delayed;
+  }
+}
+
+sub go( $$$$$ ) {
+  my( $fref, $state, $line, $i, $n ) = @_;
+  $state->{current} = $fref;
+  return &$fref( $state, $line, $i, $n );
+}
+
+sub parse_default( $$$$ ) {
+  my( $state, $line, $i, $n ) = @_;
+  my $c = '';
+  for(; $i < $n; ++$i ) {
+    $c = substr( $line, $i, 1 );
+    if( $c eq '"' ) {
+      return &go( \&parse_string_literal, $state, $line, $i+1, $n );
+    } elsif( $c eq '\'' ) {
+      return &go( \&parse_char_literal, $state, $line, $i+1, $n );
+    } elsif( $c eq '/' and '/' eq substr( $line, $i+1, 1 ) ) {
+      return &go( \&parse_line_comment, $state, $line, $i+2, $n );
+    } elsif( $c eq '/' and '*' eq substr( $line, $i+1, 1 ) ) {
+      $state->{is_preprocessor} = ($state->{buffer} =~ m/^\s*#/);
+      return &go( \&parse_block_comment, $state, $line, $i+2, $n );
+    } else {
+      $state->{buffer} .= $c;
+    }
+  }
+  &compress_empty_lines( $state );
+  $state->{continue} = ($c eq '\\');
+}
+
+sub parse_delayed( $$$$ ) {
+  my( $state, $line, $i, $n ) = @_;
+  return &go( \&parse_default, $state, $line, $i, $n );
+}
+
+sub parse_char_literal( $$$$ ) {
+  my( $state, $line, $i, $n ) = @_;
+  $state->{buffer} .= '\'';
+  my $c = '';
+  my $esc = 0;
+  for(; $i < $n; ++$i ) {
+    $c = substr( $line, $i, 1 );
+    $state->{buffer} .= $c;
+    if( $c eq '\\' ) {
+      $esc = !$esc;
+    } elsif( $c eq '\'' and !$esc ) {
+      return &go( \&parse_default, $state, $line, $i+1, $n );
+    }
+  }
+  $state->{current} = \&parse_default;
+  $state->{continue} = ($c eq '\\');
+}
+
+sub parse_string_literal( $$$$ ) {
+  my( $state, $line, $i, $n ) = @_;
+  $state->{buffer} .= '"';
+  my $c = '';
+  my $esc = 0;
+  for(; $i < $n; ++$i ) {
+    $c = substr( $line, $i, 1 );
+    $state->{buffer} .= $c;
+    if( $c eq '\\' ) {
+      $esc = !$esc;
+    } elsif( $c eq '"' and !$esc ) {
+      return &go( \&parse_default, $state, $line, $i+1, $n );
+    }
+  }
+  $state->{current} = \&parse_default;
+  $state->{continue} = ($c eq '\\');
+}
+
+sub parse_line_comment( $$$$ ) {
+  my( $state, $line, $i, $n ) = @_;
+  my $c = '';
+  $c = substr( $line, $n-1, 1 ) if $n;
+  $state->{continue} = ($c eq '\\');
+  $state->{current} = \&parse_default unless $state->{continue};
+}
+
+sub parse_block_comment( $$$$ ) {
+  my( $state, $line, $i, $n ) = @_;
+  my $c = '';
+  for(; $i < $n; ++$i ) {
+    $c = substr( $line, $i, 1 );
+    if( $c eq '*' and '/' eq substr( $line, $i+1, 1 ) ) {
+      $state->{buffer} .= ' ' unless $state->{space_printed};
+      $state->{space_printed} = 0;
+      return &go( \&parse_default, $state, $line, $i+2, $n );
+    }
+  }
+  if( !$state->{is_preprocessor} and $state->{preserve_ln} ) {
+    $state->{buffer} .= "\n";
+    $state->{space_printed} = 1;
+  }
+}
+
+sub make_parse_state( $$ ) {
+  my( $fname, $preserve_ln ) = @_;
+  my %state = ( current => \&parse_default,
+                linenumber => 0,
+                filename => $fname,
+                preserve_ln => $preserve_ln,
+                buffer => '',
+                continue => 0,
+                is_preprocessor => 0,
+                space_printed => 0,
+              );
+  return \%state;
+}
+
+sub newline( $ ) {
+  my( $state ) = @_;
+  $state->{linenumber}++;
+  if( $state->{current} == \&parse_default and
+      !$state->{continue} ) {
+    $state->{is_preprocessor} = 0;
+  }
+}
+
+sub parse_line( $$$$$ ) {
+  my( $state, $line, $out, $incs, $handled ) = @_;
+  &newline( $state );
+  chomp( $line );
+  $state->{current}( $state, $line, 0, length( $line ) );
+  if( $state->{current} == \&parse_default ) {
+    my( $fname ) = ($state->{buffer} =~ m/^\s*#\s*include\s*"(.*)"\s*$/);
+    if( defined( $fname ) and
+        ($fname = &find_file( $fname, $incs )) ) {
+      my $res = &handle_file( $fname, $out, $handled, $incs,
+                              $state->{preserve_ln});
+      if( $state->{preserve_ln} ) {
+        if( $res ) {
+          print( $out "#line ", $state->{linenumber}+1, " \"",
+                 $state->{filename}, "\"\n" );
+        } else {
+          print( $out "\n" );
+        }
+      }
+    } else {
+      print( $out $state->{buffer}, "\n" );
+    }
+    $state->{buffer} = '';
+  }
+}
+
+
+sub handle_file( $$$$$ ) {
+  my( $fname, $out, $handled, $incs, $plines ) = @_;
+  my( $id, $in ) = &file_id( $fname );
+  unless( defined( $handled->{ $id } ) ) {
+    $handled->{ $id } = 1;
+    print( $out "#line 1 \"$fname\"\n" ) if $plines;
+    my $state = &make_parse_state( $fname, $plines );
+    while( defined( my $line = <$in> ) ) {
+      &parse_line( $state, $line, $out, $incs, $handled );
+    }
+    print( $out $state->{buffer}, "\n" ) if $state->{buffer} ne '';
+    return 1;
+  }
+  return 0;
+}
+
+
+### start processing input files
+{
+  my $out = &open_output( $output );
+  my %handled = ();
+  foreach my $input ( @ARGV ) {
+    &handle_file( $input, $out, \%handled, \@incdirs, $plines );
+  }
+}
+
+
+__END__
+
+=head1 NAME
+
+amalgc - Create a single C source file for a complete C project
+
+=head1 SYNOPSIS
+
+ amalgc [options] file.c [...]
+
+ Options:
+    --include, -i    add include directory to search path
+    --output, -o     specify output file
+    --lines, -l      add #line directives for better debugging
+    --help, -h       get help
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--include, -i>
+
+Adds a directory to the search path which is used to map include'd
+filenames to real include files. This option may be specified multiple
+times.
+
+=item B<--output, -o>
+
+Specifies an output file for the amalgamated source code. Default is
+standard output.
+
+=item B<--lines, -l>
+
+Adds #line directives for the preprocessor, so that compiler error
+messages (and debug output) point to the correct file and source code
+line.
+
+=item B<--help, -h>
+
+Prints this manual page in text format.
+
+=back
+
+=head1 DESCRIPTION
+
+B<amalgc> reads the files provided on the command line, replaces all
+include-directives with the respective file contents when they are
+first encountered and prints the result to the output file (or
+C<stdout>).
+
+Certain include-directives are B<not> replaced, such as system headers
+(or more specifically any header files not found in the specified
+include directories).
+
+=head1 AUTHOR
+
+2011, Philipp Janda <siffiejoe@gmx.net>
+
+=cut
+
