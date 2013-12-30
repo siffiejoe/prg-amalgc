@@ -9,10 +9,12 @@ use Digest::MD5;
 my @incdirs = ();
 my $output = '-';
 my $plines = 0;
+my $pcomments = 0;
 my $help = 0;
 GetOptions( "include=s@" => \@incdirs,
             "output=s" =>   \$output,
             "lines" =>      \$plines,
+            "comments" =>   \$pcomments,
             "help" =>       \$help );
 pod2usage( -verbose => 2,
            -exitval => 0,
@@ -59,7 +61,7 @@ sub file_id( $ ) {
 
 sub compress_empty_lines( $ ) {
   my( $state ) = @_;
-  if( !$state->{continue} and
+  if( $state->{current} == \&parse_default and
       !$state->{preserve_ln} and
       $state->{buffer} =~ m/^\s*$/ ) {
     $state->{buffer} = '';
@@ -79,22 +81,28 @@ sub parse_default( $$$$ ) {
   for(; $i < $n; ++$i ) {
     $c = substr( $line, $i, 1 );
     if( $c eq '"' ) {
+      $state->{buffer} .= '"';
       return &go( \&parse_string_literal, $state, $line, $i+1, $n );
     } elsif( $c eq '\'' ) {
+      $state->{buffer} .= '\'';
       return &go( \&parse_char_literal, $state, $line, $i+1, $n );
     } elsif( $c eq '/' and '/' eq substr( $line, $i+1, 1 ) ) {
+      $state->{buffer} .= '//' if $state->{preserve_cmts};
       return &go( \&parse_line_comment, $state, $line, $i+2, $n );
     } elsif( $c eq '/' and '*' eq substr( $line, $i+1, 1 ) ) {
       $state->{is_preprocessor} = ($state->{buffer} =~ m/^\s*#/);
+      $state->{buffer} .= '/*' if $state->{preserve_cmts};
       return &go( \&parse_block_comment, $state, $line, $i+2, $n );
     } else {
       $state->{buffer} .= $c;
     }
   }
-  &compress_empty_lines( $state );
   $state->{continue} = ($c eq '\\');
+  &compress_empty_lines( $state );
 }
 
+# same effects as parse_default, *but* compares unequal to
+# parse_default, so avoids special handling in parse_line.
 sub parse_delayed( $$$$ ) {
   my( $state, $line, $i, $n ) = @_;
   return &go( \&parse_default, $state, $line, $i, $n );
@@ -102,7 +110,6 @@ sub parse_delayed( $$$$ ) {
 
 sub parse_char_literal( $$$$ ) {
   my( $state, $line, $i, $n ) = @_;
-  $state->{buffer} .= '\'';
   my $c = '';
   my $esc = 0;
   for(; $i < $n; ++$i ) {
@@ -114,13 +121,16 @@ sub parse_char_literal( $$$$ ) {
       return &go( \&parse_default, $state, $line, $i+1, $n );
     }
   }
-  $state->{current} = \&parse_default;
   $state->{continue} = ($c eq '\\');
+  if( !$state->{continue} ) {
+    $state->{current} = \&parse_default;
+  } else {
+    $state->{buffer} .= "\n";
+  }
 }
 
 sub parse_string_literal( $$$$ ) {
   my( $state, $line, $i, $n ) = @_;
-  $state->{buffer} .= '"';
   my $c = '';
   my $esc = 0;
   for(; $i < $n; ++$i ) {
@@ -132,41 +142,59 @@ sub parse_string_literal( $$$$ ) {
       return &go( \&parse_default, $state, $line, $i+1, $n );
     }
   }
-  $state->{current} = \&parse_default;
   $state->{continue} = ($c eq '\\');
+  if( !$state->{continue} ) {
+    $state->{current} = \&parse_default;
+  } else {
+    $state->{buffer} .= "\n";
+  }
 }
 
 sub parse_line_comment( $$$$ ) {
   my( $state, $line, $i, $n ) = @_;
   my $c = '';
+  $state->{buffer} .= substr( $line, $i ) if $state->{preserve_cmts};
   $c = substr( $line, $n-1, 1 ) if $n;
   $state->{continue} = ($c eq '\\');
-  $state->{current} = \&parse_default unless $state->{continue};
+  if( !$state->{continue} ) {
+    $state->{current} = \&parse_default;
+  } else {
+    $state->{buffer} .= "\n";
+  }
 }
 
 sub parse_block_comment( $$$$ ) {
   my( $state, $line, $i, $n ) = @_;
-  my $c = '';
   for(; $i < $n; ++$i ) {
-    $c = substr( $line, $i, 1 );
+    my $c = substr( $line, $i, 1 );
     if( $c eq '*' and '/' eq substr( $line, $i+1, 1 ) ) {
-      $state->{buffer} .= ' ' unless $state->{space_printed};
-      $state->{space_printed} = 0;
+      if( $state->{preserve_cmts} ) {
+        $state->{buffer} .= '*/';
+      } else {
+        $state->{buffer} .= ' ' unless $state->{space_printed};
+        $state->{space_printed} = 0;
+      }
       return &go( \&parse_default, $state, $line, $i+2, $n );
+    } else {
+      if( $state->{preserve_cmts} ) {
+        $state->{buffer} .= $c;
+      }
     }
   }
-  if( !$state->{is_preprocessor} and $state->{preserve_ln} ) {
+  if( $state->{preserve_cmts} or
+      (!$state->{is_preprocessor} and $state->{preserve_ln}) ) {
     $state->{buffer} .= "\n";
     $state->{space_printed} = 1;
   }
 }
 
 sub make_parse_state( $$ ) {
-  my( $fname, $preserve_ln ) = @_;
+  my( $fname, $preserve_ln, $preserve_cmts ) = @_;
   my %state = ( current => \&parse_default,
                 linenumber => 0,
                 filename => $fname,
                 preserve_ln => $preserve_ln,
+                preserve_cmts => $preserve_cmts,
                 buffer => '',
                 continue => 0,
                 is_preprocessor => 0,
@@ -194,7 +222,8 @@ sub parse_line( $$$$$ ) {
     if( defined( $fname ) and
         ($fname = &find_file( $fname, $incs )) ) {
       my $res = &handle_file( $fname, $out, $handled, $incs,
-                              $state->{preserve_ln});
+                              $state->{preserve_ln},
+                              $state->{preserve_cmts});
       if( $state->{preserve_ln} ) {
         if( $res ) {
           print( $out "#line ", $state->{linenumber}+1, " \"",
@@ -203,7 +232,7 @@ sub parse_line( $$$$$ ) {
           print( $out "\n" );
         }
       }
-    } else {
+    } else { # no #include we can replace:
       print( $out $state->{buffer}, "\n" );
     }
     $state->{buffer} = '';
@@ -212,12 +241,12 @@ sub parse_line( $$$$$ ) {
 
 
 sub handle_file( $$$$$ ) {
-  my( $fname, $out, $handled, $incs, $plines ) = @_;
+  my( $fname, $out, $handled, $incs, $plines, $pcomments ) = @_;
   my( $id, $in ) = &file_id( $fname );
   unless( defined( $handled->{ $id } ) ) {
     $handled->{ $id } = 1;
     print( $out "#line 1 \"$fname\"\n" ) if $plines;
-    my $state = &make_parse_state( $fname, $plines );
+    my $state = &make_parse_state( $fname, $plines, $pcomments );
     while( defined( my $line = <$in> ) ) {
       &parse_line( $state, $line, $out, $incs, $handled );
     }
@@ -233,7 +262,7 @@ sub handle_file( $$$$$ ) {
   my $out = &open_output( $output );
   my %handled = ();
   foreach my $input ( @ARGV ) {
-    &handle_file( $input, $out, \%handled, \@incdirs, $plines );
+    &handle_file( $input, $out, \%handled, \@incdirs, $plines, $pcomments );
   }
 }
 
@@ -252,6 +281,7 @@ amalgc - Create a single C source file for a complete C project
     --include, -i    add include directory to search path
     --output, -o     specify output file
     --lines, -l      add #line directives for better debugging
+    --comments, -c   keep comments
     --help, -h       get help
 
 =head1 OPTIONS
@@ -274,6 +304,10 @@ standard output.
 Adds #line directives for the preprocessor, so that compiler error
 messages (and debug output) point to the correct file and source code
 line.
+
+=item B<--comments, -c>
+
+Keeps comments in the amalgamated file.
 
 =item B<--help, -h>
 
